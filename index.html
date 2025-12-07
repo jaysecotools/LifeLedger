@@ -1604,620 +1604,944 @@ formatDate: (date = new Date(), format = 'medium', timezone = 'local') => {
 };
 
 // ==================== ENHANCED STORAGE MANAGER ====================
-const Storage = {
-  // Load application state with validation
-  loadState: () => {
-    const perf = PerformanceMonitor.start('loadState');
-    try {
-      const raw = localStorage.getItem(CONFIG.STORAGE_KEY);
-      if (!raw) {
-        const defaultState = {
-          modules: {},
-          enabledOrder: [],
-          settings: {},
-          version: CONFIG.VERSION,
-          schemaVersion: CONFIG.DATA_SCHEMA_VERSION,
-          createdAt: Date.now(),
-          lastModified: Date.now()
-        };
-        Storage.saveState(defaultState);
-        perf.end();
-        return defaultState;
-      }
-      
-      const data = Utils.safeParse(raw);
-      if (!data || typeof data !== 'object') {
-        throw new Error('Invalid stored data');
-      }
-      
-      // Validate data structure
-      if (!Validator.validate.importData(data)) {
-        throw new Error('Data validation failed');
-      }
-      
-      // Migration logic
-      const migrated = Storage.migrateData(data);
-      
-      perf.end();
-      return migrated;
-    } catch (error) {
-      const captured = ErrorHandler.capture(error, { operation: 'loadState' });
-      ErrorHandler.report(captured);
-      
-      // Try to recover with backup
-      const backup = Storage.getLatestBackup();
-      if (backup) {
-        UIManager.showToast('Loaded from backup due to data corruption', 'warning');
-        return backup.data;
-      }
-      
-      // Return fresh state
-      const freshState = {
-        modules: {},
-        enabledOrder: [],
-        settings: {},
-        version: CONFIG.VERSION,
-        schemaVersion: CONFIG.DATA_SCHEMA_VERSION,
-        createdAt: Date.now(),
-        lastModified: Date.now()
-      };
-      
-      perf.end();
-      return freshState;
-    }
-  },
+const Storage = (() => {
+  // Private state
+  let useIndexedDB = false;
+  let db = null;
+  const DB_NAME = 'LifeLedgerDB';
+  const DB_VERSION = 2;
+  const STORE_NAME = 'appData';
   
-  // Save application state with validation and compression
-  saveState: (state) => {
-    const perf = PerformanceMonitor.start('saveState');
-    try {
-      if (!state || typeof state !== 'object') {
-        throw new Error('Invalid state object');
+  // Public API
+  return {
+    // Initialize storage system
+    init: async () => {
+      try {
+        // Check if IndexedDB is available
+        if ('indexedDB' in window) {
+          try {
+            db = await new Promise((resolve, reject) => {
+              const request = indexedDB.open(DB_NAME, DB_VERSION);
+              
+              request.onerror = () => reject(request.error);
+              request.onsuccess = () => resolve(request.result);
+              
+              request.onupgradeneeded = (event) => {
+                const db = event.target.result;
+                if (!db.objectStoreNames.contains(STORE_NAME)) {
+                  db.createObjectStore(STORE_NAME);
+                }
+              };
+            });
+            
+            useIndexedDB = true;
+            console.log('Using IndexedDB for storage');
+          } catch (error) {
+            console.warn('Failed to initialize IndexedDB, falling back to localStorage:', error);
+            useIndexedDB = false;
+          }
+        }
+        
+        // Test localStorage quota
+        try {
+          localStorage.setItem('test', 'test');
+          localStorage.removeItem('test');
+        } catch (error) {
+          console.error('localStorage quota exceeded:', error);
+          if (!useIndexedDB) {
+            throw new Error('Storage quota exceeded and IndexedDB not available');
+          }
+        }
+        
+        return useIndexedDB ? 'indexedDB' : 'localStorage';
+      } catch (error) {
+        console.error('Storage initialization failed:', error);
+        throw error;
       }
-      
-      // Validate state structure
-      if (!state.modules || typeof state.modules !== 'object') {
-        throw new Error('Invalid modules structure');
+    },
+    
+    // Load application state with automatic storage selection
+    loadState: async () => {
+      try {
+        // Try IndexedDB first if available
+        if (useIndexedDB && db) {
+          try {
+            const data = await new Promise((resolve, reject) => {
+              const transaction = db.transaction([STORE_NAME], 'readonly');
+              const store = transaction.objectStore(STORE_NAME);
+              const request = store.get(CONFIG.STORAGE_KEY);
+              
+              request.onerror = () => reject(request.error);
+              request.onsuccess = () => resolve(request.result);
+            });
+            
+            if (data) {
+              console.log('Loaded from IndexedDB');
+              return Storage.validateAndMigrate(data);
+            }
+          } catch (error) {
+            console.warn('Failed to load from IndexedDB:', error);
+          }
+        }
+        
+        // Fall back to localStorage
+        const raw = localStorage.getItem(CONFIG.STORAGE_KEY);
+        if (!raw) {
+          const defaultState = Storage.getDefaultState();
+          await Storage.saveState(defaultState);
+          return defaultState;
+        }
+        
+        const data = Utils.safeParse(raw);
+        if (!data || typeof data !== 'object') {
+          throw new Error('Invalid stored data');
+        }
+        
+        console.log('Loaded from localStorage');
+        return Storage.validateAndMigrate(data);
+      } catch (error) {
+        ErrorHandler.capture(error, { operation: 'loadState' });
+        
+        // Try to recover from backup
+        const backup = await Storage.getLatestBackup();
+        if (backup) {
+          UIManager.showToast('Loaded from backup due to data corruption', 'warning');
+          return backup.data;
+        }
+        
+        // Return fresh state
+        return Storage.getDefaultState();
       }
-      
-      // Add metadata
-      state.lastModified = Date.now();
-      state.version = CONFIG.VERSION;
-      state.schemaVersion = CONFIG.DATA_SCHEMA_VERSION;
-      
-      // Clean up old data to prevent bloating
-      Object.keys(state.modules).forEach(moduleId => {
-        const module = state.modules[moduleId];
-        if (module && module.data) {
-          // Ensure module data is valid
-          if (!Validator.validate.moduleData(module.data)) {
-            delete state.modules[moduleId];
-            console.warn(`Removed invalid module: ${moduleId}`);
+    },
+    
+    // Save application state with compression and storage selection
+    saveState: async (state) => {
+      const perf = PerformanceMonitor.start('saveState');
+      try {
+        if (!state || typeof state !== 'object') {
+          throw new Error('Invalid state object');
+        }
+        
+        // Validate state structure
+        if (!state.modules || typeof state.modules !== 'object') {
+          throw new Error('Invalid modules structure');
+        }
+        
+        // Add metadata
+        state.lastModified = Date.now();
+        state.version = CONFIG.VERSION;
+        state.schemaVersion = CONFIG.DATA_SCHEMA_VERSION;
+        
+        // Clean up old data to prevent bloating
+        state = Storage.cleanupState(state);
+        
+        // Calculate size
+        const serialized = Utils.safeStringify(state);
+        if (!serialized) {
+          throw new Error('Failed to serialize state');
+        }
+        
+        const size = new Blob([serialized]).size;
+        console.log(`Saving ${Utils.formatBytes(size)} of data`);
+        
+        // Check storage options
+        const storageMethod = await Storage.chooseStorageMethod(size);
+        
+        try {
+          switch (storageMethod) {
+            case 'indexedDB':
+              await Storage.saveToIndexedDB(CONFIG.STORAGE_KEY, state);
+              break;
+              
+            case 'localStorage':
+              // Compress data for localStorage
+              const compressed = Storage.compressData(state);
+              if (compressed.length > 4.5 * 1024 * 1024) { // Leave 10% margin
+                throw new Error('Data too large for localStorage');
+              }
+              localStorage.setItem(CONFIG.STORAGE_KEY, compressed);
+              break;
+              
+            default:
+              throw new Error('No storage method available');
           }
           
-          // Limit items per module
-          Object.keys(module.data).forEach(key => {
-            if (Array.isArray(module.data[key]) && module.data[key].length > CONFIG.MAX_ITEMS_PER_MODULE) {
-              module.data[key] = module.data[key].slice(-CONFIG.MAX_ITEMS_PER_MODULE);
-              console.warn(`Truncated ${moduleId}.${key} to ${CONFIG.MAX_ITEMS_PER_MODULE} items`);
+          console.log(`Saved to ${storageMethod}`);
+        } catch (storageError) {
+          // If storage fails, try the other method
+          console.warn(`${storageMethod} failed, trying fallback:`, storageError);
+          
+          if (storageMethod === 'indexedDB') {
+            const compressed = Storage.compressData(state);
+            if (compressed.length < 4.5 * 1024 * 1024) {
+              localStorage.setItem(CONFIG.STORAGE_KEY, compressed);
+            } else {
+              // Data too large, need to prune
+              state = Storage.pruneLargeState(state);
+              const prunedSerialized = Utils.safeStringify(state);
+              localStorage.setItem(CONFIG.STORAGE_KEY, prunedSerialized);
+              UIManager.showToast('Data pruned to fit storage limits', 'warning');
             }
-          });
+          } else {
+            await Storage.saveToIndexedDB(CONFIG.STORAGE_KEY, state);
+          }
         }
+        
+        // Update UI
+        requestAnimationFrame(() => {
+          const lastSavedEl = document.getElementById('lastSaved');
+          if (lastSavedEl) {
+            lastSavedEl.textContent = `Saved ${Utils.formatDate(new Date(), 'time')}`;
+          }
+        });
+        
+        // Update storage usage
+        Storage.updateStorageUsage();
+        
+        // Cache the state
+        CacheManager.set('currentState', state);
+        
+        perf.end();
+        return true;
+      } catch (error) {
+        const captured = ErrorHandler.capture(error, { operation: 'saveState', stateSize: state ? Utils.getStorageSize(state) : 0 });
+        ErrorHandler.report(captured);
+        perf.end();
+        return false;
+      }
+    },
+    
+    // Choose storage method based on size
+    chooseStorageMethod: async (size) => {
+      // If IndexedDB is available, use it for large data
+      if (useIndexedDB && db) {
+        if (size > 2 * 1024 * 1024) { // Over 2MB, use IndexedDB
+          return 'indexedDB';
+        }
+      }
+      
+      // Check localStorage capacity
+      try {
+        const testData = 'x'.repeat(1024); // 1KB test
+        localStorage.setItem('test_capacity', testData);
+        localStorage.removeItem('test_capacity');
+        
+        if (size > 4.5 * 1024 * 1024) { // Over 4.5MB
+          if (useIndexedDB) {
+            return 'indexedDB';
+          } else {
+            throw new Error('Data too large for localStorage');
+          }
+        }
+        
+        return 'localStorage';
+      } catch (error) {
+        if (useIndexedDB) {
+          return 'indexedDB';
+        }
+        throw new Error('No suitable storage available');
+      }
+    },
+    
+    // Save to IndexedDB
+    saveToIndexedDB: async (key, data) => {
+      if (!db) throw new Error('IndexedDB not initialized');
+      
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.put(data, key);
+        
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => resolve();
+        
+        transaction.onerror = () => reject(transaction.error);
+      });
+    },
+    
+    // Load from IndexedDB
+    loadFromIndexedDB: async (key) => {
+      if (!db) throw new Error('IndexedDB not initialized');
+      
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readonly');
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.get(key);
+        
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => resolve(request.result);
+      });
+    },
+    
+    // Compress data for localStorage
+    compressData: (data) => {
+      try {
+        // Simple compression: remove whitespace and use shorter property names
+        const compressed = JSON.stringify(data)
+          .replace(/\s+/g, ' ') // Replace multiple whitespace with single space
+          .replace(/":\s*"/g, '":"') // Remove spaces after colons in strings
+          .replace(/,\s*"/g, ',"'); // Remove spaces after commas
+        
+        return compressed;
+      } catch (error) {
+        console.warn('Compression failed, using uncompressed data:', error);
+        return JSON.stringify(data);
+      }
+    },
+    
+    // Clean up state to reduce size
+    cleanupState: (state) => {
+      const cleaned = Utils.deepClone(state);
+      
+      // Remove old activity logs
+      const oneMonthAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+      
+      Object.keys(cleaned.modules || {}).forEach(moduleId => {
+        const module = cleaned.modules[moduleId];
+        if (!module?.data) return;
+        
+        // Limit items per module
+        Object.keys(module.data).forEach(key => {
+          if (Array.isArray(module.data[key])) {
+            // Remove old items (older than 6 months)
+            module.data[key] = module.data[key].filter(item => {
+              const timestamp = item.updated || item.created || item.date;
+              return timestamp > oneMonthAgo;
+            });
+            
+            // Limit to max items
+            if (module.data[key].length > CONFIG.MAX_ITEMS_PER_MODULE) {
+              module.data[key] = module.data[key]
+                .sort((a, b) => (b.updated || b.created || b.date) - (a.updated || a.created || a.date))
+                .slice(0, CONFIG.MAX_ITEMS_PER_MODULE);
+              
+              console.log(`Truncated ${moduleId}.${key} to ${CONFIG.MAX_ITEMS_PER_MODULE} items`);
+            }
+          }
+        });
       });
       
-      // Validate enabled order
-      if (!Array.isArray(state.enabledOrder)) {
-        state.enabledOrder = [];
+      // Clean up old backups
+      if (cleaned.backups && Array.isArray(cleaned.backups)) {
+        cleaned.backups = cleaned.backups
+          .sort((a, b) => b.timestamp - a.timestamp)
+          .slice(0, CONFIG.MAX_BACKUPS);
       }
       
-      // Remove duplicates and invalid module IDs
-      state.enabledOrder = [...new Set(state.enabledOrder.filter(id => 
-        Validator.validate.moduleId(id) && state.modules[id]
-      ))];
+      return cleaned;
+    },
+    
+    // Prune large state for localStorage
+    pruneLargeState: (state) => {
+      const pruned = Utils.deepClone(state);
+      const targetSize = 4 * 1024 * 1024; // Target 4MB
       
-      const serialized = Utils.safeStringify(state);
-      if (!serialized) {
-        throw new Error('Failed to serialize state');
-      }
-      
-      // Check storage quota
-      const quota = Storage.checkQuota(serialized.length);
-      if (!quota.available) {
-        throw new Error(`Storage quota exceeded: ${quota.message}`);
-      }
-      
-      localStorage.setItem(CONFIG.STORAGE_KEY, serialized);
-      
-      // Update UI
-      requestAnimationFrame(() => {
-        const lastSavedEl = document.getElementById('lastSaved');
-        if (lastSavedEl) {
-          lastSavedEl.textContent = `Saved ${Utils.formatDate(new Date(), 'time')}`;
-        }
+      // Remove least recently used modules first
+      const moduleUsage = [];
+      Object.keys(pruned.modules || {}).forEach(moduleId => {
+        const module = pruned.modules[moduleId];
+        const lastViewed = module?.meta?.lastViewed || 0;
+        const size = Utils.getStorageSize(module);
+        moduleUsage.push({ moduleId, lastViewed, size });
       });
       
-      // Update storage usage
-      Storage.updateStorageUsage();
+      // Sort by last viewed (oldest first)
+      moduleUsage.sort((a, b) => a.lastViewed - b.lastViewed);
       
-      // Cache the state
-      CacheManager.set('currentState', state);
-      
-      perf.end();
-      return true;
-    } catch (error) {
-      const captured = ErrorHandler.capture(error, { operation: 'saveState', state });
-      ErrorHandler.report(captured);
-      perf.end();
-      return false;
-    }
-  },
-  
-  // Check storage quota
-  checkQuota: (additionalBytes = 0) => {
-    try {
-      // localStorage doesn't have quota API, but we can estimate
-      let total = 0;
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        if (key) {
-          total += (localStorage.getItem(key)?.length || 0) * 2; // Approximate bytes
+      // Remove modules until we're under the limit
+      let currentSize = Utils.getStorageSize(pruned);
+      for (const { moduleId, size } of moduleUsage) {
+        if (currentSize <= targetSize) break;
+        
+        if (moduleId !== 'dashboard') { // Don't remove dashboard
+          delete pruned.modules[moduleId];
+          currentSize -= size;
+          console.log(`Pruned module: ${moduleId}`);
         }
       }
       
-      total += additionalBytes;
-      const maxQuota = 5 * 1024 * 1024; // 5MB typical limit
-      
-      return {
-        used: total,
-        available: total < maxQuota * 0.9, // Leave 10% margin
-        percentage: (total / maxQuota) * 100,
-        message: total > maxQuota 
-          ? 'Storage limit exceeded' 
-          : `${Utils.formatBytes(total)} of ${Utils.formatBytes(maxQuota)} used`
-      };
-    } catch (e) {
-      ErrorHandler.capture(e, { operation: 'checkQuota' });
-      return { used: 0, available: true, percentage: 0, message: 'Unknown' };
-    }
-  },
-  
-  // Create backup with validation
-  createBackup: (label = 'Manual backup', metadata = {}) => {
-    const perf = PerformanceMonitor.start('createBackup');
-    try {
-      const state = Storage.loadState();
-      
-      // Validate state before backup
-      if (!Validator.validate.importData(state)) {
-        throw new Error('Invalid state for backup');
+      return pruned;
+    },
+    
+    // Get default state
+    getDefaultState: () => ({
+      modules: {},
+      enabledOrder: [],
+      settings: {
+        autoSave: true,
+        animations: true,
+        backupFrequency: 'weekly',
+        storageMethod: 'auto'
+      },
+      version: CONFIG.VERSION,
+      schemaVersion: CONFIG.DATA_SCHEMA_VERSION,
+      createdAt: Date.now(),
+      lastModified: Date.now(),
+      storageInfo: {
+        method: useIndexedDB ? 'indexedDB' : 'localStorage',
+        lastCleanup: Date.now()
       }
-      
-      const backup = {
-        id: Utils.generateSecureId(),
-        label: Validator.sanitize.input(label).substring(0, 100),
-        timestamp: Date.now(),
-        data: state,
-        version: CONFIG.VERSION,
-        schemaVersion: CONFIG.DATA_SCHEMA_VERSION,
-        size: Utils.getStorageSize(state),
-        metadata: {
-          ...metadata,
-          userAgent: navigator.userAgent,
-          platform: navigator.platform
-        }
-      };
-      
-      const backups = Storage.getBackups();
-      backups.unshift(backup);
-      
-      // Keep only MAX_BACKUPS
-      if (backups.length > CONFIG.MAX_BACKUPS) {
-        const removed = backups.splice(CONFIG.MAX_BACKUPS);
-        console.log(`Removed ${removed.length} old backups`);
-      }
-      
-      localStorage.setItem(CONFIG.BACKUP_KEY, Utils.safeStringify(backups));
-      
-      // Clear backup cache
-      CacheManager.delete('backups');
-      
-      perf.end();
-      return backup.id;
-    } catch (error) {
-      const captured = ErrorHandler.capture(error, { operation: 'createBackup', label });
-      ErrorHandler.report(captured);
-      perf.end();
-      return null;
-    }
-  },
-  
-  // Get all backups with cache
-  getBackups: () => {
-    try {
-      const cached = CacheManager.get('backups');
-      if (cached) return cached;
-      
-      const raw = localStorage.getItem(CONFIG.BACKUP_KEY);
-      const backups = raw ? Utils.safeParse(raw, []) : [];
-      
-      // Validate backups
-      const validBackups = backups.filter(backup => 
-        backup && 
-        backup.id && 
-        backup.timestamp && 
-        backup.data &&
-        Validator.validate.importData(backup.data)
-      );
-      
-      CacheManager.set('backups', validBackups);
-      return validBackups;
-    } catch (error) {
-      ErrorHandler.capture(error, { operation: 'getBackups' });
-      return [];
-    }
-  },
-  
-  // Get latest backup
-  getLatestBackup: () => {
-    const backups = Storage.getBackups();
-    return backups.length > 0 ? backups[0] : null;
-  },
-  
-  // Restore from backup with validation
-  restoreBackup: (backupId) => {
-    const perf = PerformanceMonitor.start('restoreBackup');
-    try {
-      const backups = Storage.getBackups();
-      const backup = backups.find(b => b.id === backupId);
-      
-      if (!backup) {
-        throw new Error('Backup not found');
-      }
-      
-      // Validate backup data
-      if (!Validator.validate.importData(backup.data)) {
-        throw new Error('Backup data is invalid');
-      }
-      
-      // Create restore point before restoring
-      Storage.createBackup('Pre-restore backup', { restoredFrom: backupId });
-      
-      localStorage.setItem(CONFIG.STORAGE_KEY, Utils.safeStringify(backup.data));
-      
-      // Clear caches
-      CacheManager.clear();
-      
-      perf.end();
-      return true;
-    } catch (error) {
-      const captured = ErrorHandler.capture(error, { operation: 'restoreBackup', backupId });
-      ErrorHandler.report(captured);
-      perf.end();
-      return false;
-    }
-  },
-  
-  // Update storage usage display
-  updateStorageUsage: () => {
-    try {
-      const quota = Storage.checkQuota();
-      const usageEl = document.getElementById('storageUsage');
-      
-      if (usageEl) {
-        const percent = Math.min(100, quota.percentage);
-        let color = 'success';
-        
-        if (percent > 80) color = 'danger';
-        else if (percent > 60) color = 'warning';
-        
-        usageEl.innerHTML = `
-          <span>Storage: ${Utils.formatBytes(quota.used)}</span>
-          <div style="width:100px;height:4px;background:rgba(0,0,0,0.1);border-radius:2px;margin-top:2px">
-            <div style="width:${percent}%;height:100%;background:var(--${color});border-radius:2px"></div>
-          </div>
-        `;
-      }
-    } catch (error) {
-      ErrorHandler.capture(error, { operation: 'updateStorageUsage' });
-    }
-  },
-  
-  // Export data with options
-  exportData: (options = {}) => {
-    try {
-      const state = Storage.loadState();
-      const {
-        format = 'json',
-        includeBackups = false,
-        includeMetadata = true,
-        compress = false
-      } = options;
-      
-      const exportData = {
-        ...state,
-        exportDate: new Date().toISOString(),
-        exportVersion: CONFIG.VERSION,
-        exportOptions: options
-      };
-      
-      if (includeBackups) {
-        exportData.backups = Storage.getBackups();
-      }
-      
-      if (!includeMetadata) {
-        delete exportData.exportOptions;
-        delete exportData.exportMetadata;
-      }
-      
-      let output;
-      switch (format) {
-        case 'json':
-          output = Utils.safeStringify(exportData, null, 2);
-          break;
-        case 'csv':
-          output = Storage.convertToCSV(exportData);
-          break;
-        case 'minified':
-          output = Utils.safeStringify(exportData);
-          break;
-        default:
-          throw new Error(`Unsupported format: ${format}`);
-      }
-      
-      if (compress && typeof output === 'string') {
-        // Simple compression (remove whitespace)
-        output = output.replace(/\s+/g, ' ');
-      }
-      
-      return output;
-    } catch (error) {
-      ErrorHandler.capture(error, { operation: 'exportData', options });
-      throw error;
-    }
-  },
-  
-  // Import data with validation and merging options
-  importData: (data, options = {}) => {
-    const perf = PerformanceMonitor.start('importData');
-    try {
-      const {
-        format = 'json',
-        merge = true,
-        overwrite = false,
-        validate = true
-      } = options;
-      
-      let imported;
-      switch (format) {
-        case 'json':
-          imported = Utils.safeParse(data);
-          break;
-        case 'csv':
-          imported = Storage.parseCSV(data);
-          break;
-        default:
-          throw new Error(`Unsupported format: ${format}`);
-      }
-      
-      if (!imported || typeof imported !== 'object') {
-        throw new Error('Invalid data format');
-      }
-      
-      // Validate imported data
-      if (validate && !Validator.validate.importData(imported)) {
-        throw new Error('Import data validation failed');
-      }
-      
-      // Create backup before import
-      Storage.createBackup('Pre-import backup', { importOptions: options });
-      
-      const current = Storage.loadState();
-      let merged;
-      
-      if (overwrite) {
-        // Full overwrite
-        merged = {
-          ...imported,
-          // Preserve some metadata
-          createdAt: current.createdAt || Date.now(),
-          lastModified: Date.now()
-        };
-      } else if (merge) {
-        // Smart merge
-        merged = Utils.deepMerge({}, current, imported);
-        merged.lastModified = Date.now();
-        
-        // Merge enabled order
-        if (imported.enabledOrder && Array.isArray(imported.enabledOrder)) {
-          merged.enabledOrder = [...new Set([...current.enabledOrder, ...imported.enabledOrder])];
-        }
-      } else {
-        // Add as new modules (no overwrite)
-        merged = { ...current };
-        
-        if (imported.modules) {
-          Object.keys(imported.modules).forEach(moduleId => {
-            if (!merged.modules[moduleId]) {
-              merged.modules[moduleId] = imported.modules[moduleId];
-            }
-          });
-        }
-        
-        merged.lastModified = Date.now();
+    }),
+    
+    // Validate and migrate data
+    validateAndMigrate: (data) => {
+      if (!data || typeof data !== 'object') {
+        return Storage.getDefaultState();
       }
       
       // Ensure required fields
-      merged.version = CONFIG.VERSION;
-      merged.schemaVersion = CONFIG.DATA_SCHEMA_VERSION;
+      if (!data.modules) data.modules = {};
+      if (!data.enabledOrder) data.enabledOrder = [];
+      if (!data.settings) data.settings = {};
+      if (!data.version) data.version = CONFIG.VERSION;
+      if (!data.schemaVersion) data.schemaVersion = 1;
       
-      Storage.saveState(merged);
-      perf.end();
-      return true;
-    } catch (error) {
-      const captured = ErrorHandler.capture(error, { operation: 'importData', options });
-      ErrorHandler.report(captured);
-      perf.end();
-      throw error;
-    }
-  },
-  
-  // Migration logic
-  migrateData: (data) => {
-    if (!data || typeof data !== 'object') return data;
+      // Migration logic
+      return Storage.migrateData(data);
+    },
     
-    // Ensure version fields
-    if (!data.version) data.version = '1.0.0';
-    if (!data.schemaVersion) data.schemaVersion = 1;
-    
-    // Migration from v1 to v2
-    if (data.schemaVersion < 2) {
-      console.log('Migrating data from schema v1 to v2');
-      
-      // Add metadata to modules
-      if (data.modules) {
-        Object.keys(data.modules).forEach(moduleId => {
-          const module = data.modules[moduleId];
-          if (module && !module.meta) {
-            module.meta = {
-              created: Date.now(),
-              updated: Date.now(),
-              version: '2.0.0'
-            };
+    // Get current storage usage
+    getStorageUsage: async () => {
+      try {
+        let total = 0;
+        let details = {};
+        
+        // Calculate localStorage usage
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key) {
+            const value = localStorage.getItem(key);
+            const size = (value?.length || 0) * 2; // Approximate bytes
+            total += size;
+            details[key] = { size, method: 'localStorage' };
           }
-        });
-      }
-      
-      // Add timestamps
-      if (!data.createdAt) data.createdAt = Date.now();
-      if (!data.lastModified) data.lastModified = Date.now();
-      
-      data.schemaVersion = 2;
-    }
-    
-    // Ensure enabledOrder is an array
-    if (!Array.isArray(data.enabledOrder)) {
-      data.enabledOrder = Object.keys(data.modules || {});
-    }
-    
-    // Clean up any null/undefined values
-    const clean = Utils.deepClone(data);
-    
-    return clean;
-  },
-  
-  // Convert to CSV
-  convertToCSV: (data) => {
-    try {
-      const rows = [];
-      rows.push('Module,Item Count,Last Updated,Size');
-      
-      Object.keys(data.modules || {}).forEach(moduleId => {
-        const module = data.modules[moduleId];
-        const itemCount = Object.keys(module?.data || {}).reduce((count, key) => {
-          if (Array.isArray(module.data[key])) return count + module.data[key].length;
-          return count + 1;
-        }, 0);
-        
-        const size = Utils.getStorageSize(module);
-        
-        rows.push(`${moduleId},${itemCount},${new Date().toISOString()},${size}`);
-      });
-      
-      return rows.join('\n');
-    } catch (e) {
-      ErrorHandler.capture(e, { data });
-      return 'Error generating CSV';
-    }
-  },
-  
-  // Parse CSV
-  parseCSV: (csv) => {
-    try {
-      const lines = csv.split('\n').filter(line => line.trim());
-      const result = { modules: {}, enabledOrder: [], settings: {} };
-      
-      lines.forEach((line, index) => {
-        if (index === 0) return; // Skip header
-        
-        const [moduleId] = line.split(',');
-        if (moduleId && Validator.validate.moduleId(moduleId) && !result.enabledOrder.includes(moduleId)) {
-          result.enabledOrder.push(moduleId);
-          result.modules[moduleId] = { data: {}, meta: {} };
         }
-      });
-      
-      return result;
-    } catch (e) {
-      ErrorHandler.capture(e, { csv });
-      throw new Error('Failed to parse CSV');
-    }
-  },
-  
-  // Clear all data (with confirmation)
-  clearAllData: () => {
-    try {
-      // Create final backup
-      Storage.createBackup('Final backup before clearing');
-      
-      // Clear all app data
-      const keys = [
-        CONFIG.STORAGE_KEY,
-        CONFIG.BACKUP_KEY,
-        CONFIG.SETTINGS_KEY,
-        CONFIG.SESSION_KEY,
-        'lifeledger_errors',
-        'lifeledger_theme'
-      ];
-      
-      keys.forEach(key => localStorage.removeItem(key));
-      
-      // Clear caches
-      CacheManager.clear();
-      
-      return true;
-    } catch (error) {
-      ErrorHandler.capture(error, { operation: 'clearAllData' });
-      return false;
-    }
-  },
-  
-  // Get data statistics
-  getStats: () => {
-    const state = Storage.loadState();
-    const stats = {
-      totalModules: Object.keys(state.modules || {}).length,
-      totalItems: 0,
-      totalSize: 0,
-      byModule: {}
-    };
-    
-    Object.keys(state.modules || {}).forEach(moduleId => {
-      const module = state.modules[moduleId];
-      let itemCount = 0;
-      
-      if (module?.data) {
-        Object.keys(module.data).forEach(key => {
-          if (Array.isArray(module.data[key])) {
-            itemCount += module.data[key].length;
-          } else if (module.data[key] !== null) {
-            itemCount += 1;
+        
+        // Calculate IndexedDB usage if available
+        if (useIndexedDB && db) {
+          try {
+            const idbSize = await Storage.getIndexedDBSize();
+            total += idbSize;
+            details['indexedDB'] = { size: idbSize, method: 'indexedDB' };
+          } catch (error) {
+            console.warn('Failed to get IndexedDB size:', error);
           }
-        });
+        }
+        
+        const maxQuota = 5 * 1024 * 1024; // 5MB typical mobile limit
+        
+        return {
+          used: total,
+          available: total < maxQuota * 0.9, // Leave 10% margin
+          percentage: (total / maxQuota) * 100,
+          maxQuota,
+          details,
+          message: `${Utils.formatBytes(total)} of ${Utils.formatBytes(maxQuota)} used`
+        };
+      } catch (error) {
+        console.error('Failed to calculate storage usage:', error);
+        return { used: 0, available: true, percentage: 0, message: 'Unknown' };
+      }
+    },
+    
+    // Get IndexedDB size (approximate)
+    getIndexedDBSize: async () => {
+      if (!db) return 0;
+      
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readonly');
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.getAll();
+        
+        let total = 0;
+        
+        request.onsuccess = () => {
+          const items = request.result;
+          items.forEach(item => {
+            if (item) {
+              const serialized = JSON.stringify(item);
+              total += new Blob([serialized]).size;
+            }
+          });
+          resolve(total);
+        };
+        
+        request.onerror = () => reject(request.error);
+      });
+    },
+    
+    // Update storage usage display
+    updateStorageUsage: async () => {
+      try {
+        const usage = await Storage.getStorageUsage();
+        const usageEl = document.getElementById('storageUsage');
+        
+        if (usageEl) {
+          const percent = Math.min(100, usage.percentage);
+          let color = 'success';
+          
+          if (percent > 90) color = 'danger';
+          else if (percent > 70) color = 'warning';
+          
+          usageEl.innerHTML = `
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+              <span style="font-size:11px">Storage:</span>
+              <span style="font-size:11px;font-weight:500">${Utils.formatBytes(usage.used)}</span>
+              ${useIndexedDB ? '<span style="font-size:9px;background:var(--info);color:white;padding:1px 4px;border-radius:3px">IDB</span>' : ''}
+            </div>
+            <div style="width:100px;height:4px;background:rgba(0,0,0,0.1);border-radius:2px">
+              <div style="width:${percent}%;height:100%;background:var(--${color});border-radius:2px"></div>
+            </div>
+            ${percent > 80 ? `
+              <div style="font-size:9px;color:var(--${color});margin-top:2px">
+                ${percent > 90 ? '⚠️ Nearly full' : 'Getting full'}
+              </div>
+            ` : ''}
+          `;
+          
+          // Show warning if storage is nearly full
+          if (percent > 80 && !CacheManager.get('storageWarningShown')) {
+            UIManager.showToast(
+              `Storage ${percent > 90 ? 'nearly full' : 'getting full'} (${Math.round(percent)}%). Consider exporting old data.`,
+              percent > 90 ? 'danger' : 'warning',
+              5000
+            );
+            CacheManager.set('storageWarningShown', true, 300000); // Show every 5 minutes max
+          }
+        }
+      } catch (error) {
+        console.error('Failed to update storage usage:', error);
+      }
+    },
+    
+    // Optimize storage (run periodically)
+    optimizeStorage: async () => {
+      try {
+        const state = await Storage.loadState();
+        const usage = await Storage.getStorageUsage();
+        
+        // If storage is over 70% full, suggest cleanup
+        if (usage.percentage > 70) {
+          const shouldCleanup = confirm(
+            `Storage is ${Math.round(usage.percentage)}% full. ` +
+            'Would you like to clean up old data to free up space?'
+          );
+          
+          if (shouldCleanup) {
+            UIManager.showToast('Cleaning up old data...', 'info');
+            
+            // Remove data older than 3 months
+            const threeMonthsAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
+            let itemsRemoved = 0;
+            
+            Object.keys(state.modules || {}).forEach(moduleId => {
+              const module = state.modules[moduleId];
+              if (!module?.data) return;
+              
+              Object.keys(module.data).forEach(key => {
+                if (Array.isArray(module.data[key])) {
+                  const originalLength = module.data[key].length;
+                  module.data[key] = module.data[key].filter(item => {
+                    const timestamp = item.updated || item.created || item.date;
+                    return timestamp > threeMonthsAgo;
+                  });
+                  itemsRemoved += originalLength - module.data[key].length;
+                }
+              });
+            });
+            
+            await Storage.saveState(state);
+            
+            UIManager.showToast(
+              `Cleaned up ${itemsRemoved} old items. Storage optimized.`,
+              'success'
+            );
+            
+            Storage.updateStorageUsage();
+          }
+        }
+      } catch (error) {
+        ErrorHandler.capture(error, { operation: 'optimizeStorage' });
+        console.error('Storage optimization failed:', error);
+      }
+    },
+    
+    // Export data with size-aware compression
+    exportData: async (options = {}) => {
+      try {
+        const state = await Storage.loadState();
+        const {
+          format = 'json',
+          includeBackups = false,
+          compress = true,
+          maxSize = 10 * 1024 * 1024 // 10MB max
+        } = options;
+        
+        let exportData = {
+          ...state,
+          exportDate: new Date().toISOString(),
+          exportVersion: CONFIG.VERSION,
+          storageInfo: {
+            method: useIndexedDB ? 'indexedDB' : 'localStorage',
+            size: Utils.getStorageSize(state)
+          }
+        };
+        
+        if (includeBackups) {
+          exportData.backups = await Storage.getBackups();
+        }
+        
+        let output;
+        switch (format) {
+          case 'json':
+            output = Utils.safeStringify(exportData, null, 2);
+            break;
+          case 'minified':
+            output = Utils.safeStringify(exportData);
+            break;
+          case 'csv':
+            output = Storage.convertToCSV(exportData);
+            break;
+          default:
+            throw new Error(`Unsupported format: ${format}`);
+        }
+        
+        // Compress if requested and data is large
+        if (compress && output.length > 1024 * 1024) { // Over 1MB
+          output = Storage.compressData(exportData);
+        }
+        
+        // Check if export would be too large
+        const exportSize = new Blob([output]).size;
+        if (exportSize > maxSize) {
+          throw new Error(`Export would be ${Utils.formatBytes(exportSize)}, exceeding limit of ${Utils.formatBytes(maxSize)}. Try exporting without backups or using CSV format.`);
+        }
+        
+        return output;
+      } catch (error) {
+        ErrorHandler.capture(error, { operation: 'exportData', options });
+        throw error;
+      }
+    },
+    
+    // Get backups with IndexedDB support
+    getBackups: async () => {
+      try {
+        // Try IndexedDB first
+        if (useIndexedDB && db) {
+          try {
+            const backups = await Storage.loadFromIndexedDB(CONFIG.BACKUP_KEY);
+            if (backups && Array.isArray(backups)) {
+              return backups;
+            }
+          } catch (error) {
+            console.warn('Failed to load backups from IndexedDB:', error);
+          }
+        }
+        
+        // Fall back to localStorage
+        const raw = localStorage.getItem(CONFIG.BACKUP_KEY);
+        const backups = raw ? Utils.safeParse(raw, []) : [];
+        
+        // Validate backups
+        return backups.filter(backup => 
+          backup && 
+          backup.id && 
+          backup.timestamp && 
+          backup.data
+        );
+      } catch (error) {
+        ErrorHandler.capture(error, { operation: 'getBackups' });
+        return [];
+      }
+    },
+    
+    // Create backup with size checking
+    createBackup: async (label = 'Manual backup', metadata = {}) => {
+      try {
+        const state = await Storage.loadState();
+        const stateSize = Utils.getStorageSize(state);
+        
+        // Check if backup would exceed storage limits
+        const usage = await Storage.getStorageUsage();
+        const backupSizeEstimate = stateSize * 1.1; // Estimate 10% overhead
+        
+        if (usage.used + backupSizeEstimate > usage.maxQuota * 0.9) {
+          // Clean up old backups to make space
+          const backups = await Storage.getBackups();
+          if (backups.length > 1) {
+            // Remove oldest backups until we have space
+            backups.sort((a, b) => a.timestamp - b.timestamp);
+            while (backups.length > 1 && usage.used + backupSizeEstimate > usage.maxQuota * 0.9) {
+              backups.shift();
+            }
+            
+            // Save trimmed backups
+            if (useIndexedDB && db) {
+              await Storage.saveToIndexedDB(CONFIG.BACKUP_KEY, backups);
+            } else {
+              localStorage.setItem(CONFIG.BACKUP_KEY, JSON.stringify(backups));
+            }
+            
+            UIManager.showToast('Removed old backups to make space', 'warning');
+          }
+        }
+        
+        const backup = {
+          id: Utils.generateSecureId(),
+          label: Validator.sanitize.input(label).substring(0, 100),
+          timestamp: Date.now(),
+          data: state,
+          version: CONFIG.VERSION,
+          size: stateSize,
+          metadata: {
+            ...metadata,
+            storageMethod: useIndexedDB ? 'indexedDB' : 'localStorage'
+          }
+        };
+        
+        const backups = await Storage.getBackups();
+        backups.unshift(backup);
+        
+        // Keep only MAX_BACKUPS
+        if (backups.length > CONFIG.MAX_BACKUPS) {
+          backups.splice(CONFIG.MAX_BACKUPS);
+        }
+        
+        // Save backups
+        if (useIndexedDB && db) {
+          await Storage.saveToIndexedDB(CONFIG.BACKUP_KEY, backups);
+        } else {
+          localStorage.setItem(CONFIG.BACKUP_KEY, JSON.stringify(backups));
+        }
+        
+        // Clear backup cache
+        CacheManager.delete('backups');
+        
+        console.log(`Backup created: ${label} (${Utils.formatBytes(stateSize)})`);
+        return backup.id;
+      } catch (error) {
+        ErrorHandler.capture(error, { operation: 'createBackup', label });
+        console.error('Backup creation failed:', error);
+        return null;
+      }
+    },
+    
+    // Clear all data with storage method awareness
+    clearAllData: async () => {
+      try {
+        // Create final backup
+        await Storage.createBackup('Final backup before clearing');
+        
+        // Clear localStorage
+        const keys = [
+          CONFIG.STORAGE_KEY,
+          CONFIG.BACKUP_KEY,
+          CONFIG.SETTINGS_KEY,
+          CONFIG.SESSION_KEY,
+          'lifeledger_errors',
+          'lifeledger_theme',
+          'last_auto_backup',
+          'storageWarningShown'
+        ];
+        
+        keys.forEach(key => localStorage.removeItem(key));
+        
+        // Clear IndexedDB if used
+        if (useIndexedDB && db) {
+          try {
+            await new Promise((resolve, reject) => {
+              const transaction = db.transaction([STORE_NAME], 'readwrite');
+              const store = transaction.objectStore(STORE_NAME);
+              const request = store.clear();
+              
+              request.onerror = () => reject(request.error);
+              request.onsuccess = () => resolve();
+            });
+          } catch (error) {
+            console.warn('Failed to clear IndexedDB:', error);
+          }
+        }
+        
+        // Clear caches
+        CacheManager.clear();
+        
+        console.log('All data cleared');
+        return true;
+      } catch (error) {
+        ErrorHandler.capture(error, { operation: 'clearAllData' });
+        console.error('Failed to clear data:', error);
+        return false;
+      }
+    },
+    
+    // Migration logic (unchanged from previous version)
+    migrateData: (data) => {
+      if (!data || typeof data !== 'object') return data;
+      
+      // Ensure version fields
+      if (!data.version) data.version = '1.0.0';
+      if (!data.schemaVersion) data.schemaVersion = 1;
+      
+      // Migration from v1 to v2
+      if (data.schemaVersion < 2) {
+        console.log('Migrating data from schema v1 to v2');
+        
+        // Add metadata to modules
+        if (data.modules) {
+          Object.keys(data.modules).forEach(moduleId => {
+            const module = data.modules[moduleId];
+            if (module && !module.meta) {
+              module.meta = {
+                created: Date.now(),
+                updated: Date.now(),
+                version: '2.0.0'
+              };
+            }
+          });
+        }
+        
+        // Add timestamps
+        if (!data.createdAt) data.createdAt = Date.now();
+        if (!data.lastModified) data.lastModified = Date.now();
+        
+        data.schemaVersion = 2;
       }
       
-      stats.byModule[moduleId] = {
-        items: itemCount,
-        size: Utils.getStorageSize(module),
-        lastUpdated: module?.meta?.updated || 0
+      // Ensure enabledOrder is an array
+      if (!Array.isArray(data.enabledOrder)) {
+        data.enabledOrder = Object.keys(data.modules || {});
+      }
+      
+      // Clean up any null/undefined values
+      const clean = Utils.deepClone(data);
+      
+      return clean;
+    },
+    
+    // Convert to CSV (unchanged)
+    convertToCSV: (data) => {
+      try {
+        const rows = [];
+        rows.push('Module,Item Count,Last Updated,Size');
+        
+        Object.keys(data.modules || {}).forEach(moduleId => {
+          const module = data.modules[moduleId];
+          const itemCount = Object.keys(module?.data || {}).reduce((count, key) => {
+            if (Array.isArray(module.data[key])) return count + module.data[key].length;
+            return count + 1;
+          }, 0);
+          
+          const size = Utils.getStorageSize(module);
+          
+          rows.push(`${moduleId},${itemCount},${new Date().toISOString()},${size}`);
+        });
+        
+        return rows.join('\n');
+      } catch (e) {
+        ErrorHandler.capture(e, { data });
+        return 'Error generating CSV';
+      }
+    },
+    
+    // Parse CSV (unchanged)
+    parseCSV: (csv) => {
+      try {
+        const lines = csv.split('\n').filter(line => line.trim());
+        const result = { modules: {}, enabledOrder: [], settings: {} };
+        
+        lines.forEach((line, index) => {
+          if (index === 0) return; // Skip header
+          
+          const [moduleId] = line.split(',');
+          if (moduleId && Validator.validate.moduleId(moduleId) && !result.enabledOrder.includes(moduleId)) {
+            result.enabledOrder.push(moduleId);
+            result.modules[moduleId] = { data: {}, meta: {} };
+          }
+        });
+        
+        return result;
+      } catch (e) {
+        ErrorHandler.capture(e, { csv });
+        throw new Error('Failed to parse CSV');
+      }
+    },
+    
+    // Get data statistics
+    getStats: async () => {
+      const state = await Storage.loadState();
+      const stats = {
+        totalModules: Object.keys(state.modules || {}).length,
+        totalItems: 0,
+        totalSize: 0,
+        byModule: {},
+        storageMethod: useIndexedDB ? 'indexedDB' : 'localStorage'
       };
       
-      stats.totalItems += itemCount;
-      stats.totalSize += stats.byModule[moduleId].size;
-    });
+      Object.keys(state.modules || {}).forEach(moduleId => {
+        const module = state.modules[moduleId];
+        let itemCount = 0;
+        
+        if (module?.data) {
+          Object.keys(module.data).forEach(key => {
+            if (Array.isArray(module.data[key])) {
+              itemCount += module.data[key].length;
+            } else if (module.data[key] !== null) {
+              itemCount += 1;
+            }
+          });
+        }
+        
+        stats.byModule[moduleId] = {
+          items: itemCount,
+          size: Utils.getStorageSize(module),
+          lastUpdated: module?.meta?.updated || 0
+        };
+        
+        stats.totalItems += itemCount;
+        stats.totalSize += stats.byModule[moduleId].size;
+      });
+      
+      return stats;
+    },
     
-    return stats;
-  }
-};
+    // Check storage quota with better mobile detection
+    checkQuota: () => {
+      try {
+        // Mobile browsers have stricter limits
+        const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        const maxQuota = isMobile ? 5 * 1024 * 1024 : 10 * 1024 * 1024; // 5MB mobile, 10MB desktop
+        
+        let total = 0;
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key) {
+            total += (localStorage.getItem(key)?.length || 0) * 2;
+          }
+        }
+        
+        // Add IndexedDB size estimate
+        if (useIndexedDB) {
+          total += 1024 * 1024; // Estimate 1MB for IndexedDB
+        }
+        
+        return {
+          used: total,
+          available: total < maxQuota * 0.9, // Leave 10% margin
+          percentage: (total / maxQuota) * 100,
+          maxQuota,
+          isMobile,
+          message: total > maxQuota 
+            ? `Storage limit exceeded (${Utils.formatBytes(total)} of ${Utils.formatBytes(maxQuota)})`
+            : `${Utils.formatBytes(total)} of ${Utils.formatBytes(maxQuota)} used`
+        };
+      } catch (e) {
+        return { used: 0, available: true, percentage: 0, message: 'Unknown' };
+      }
+    }
+  };
+})();
+
 
 // ==================== ENHANCED UI MANAGER ====================
 const UIManager = (() => {
@@ -3971,7 +4295,7 @@ const ModuleSystem = (() => {
         }
         
         if (welcomeView) {
-          welcomeView.classList.add('hidden');
+          welcomeView.style.display = 'none';
         }
         
         // Update active state
@@ -3989,11 +4313,18 @@ const ModuleSystem = (() => {
         currentModuleId = id;
         
         // Clear module area with fade out
-        moduleAreaEl.style.opacity = '0.5';
-        setTimeout(() => {
-          moduleAreaEl.innerHTML = '';
-          moduleAreaEl.style.opacity = '1';
-        }, 150);
+// Clear module area immediately, then fade in new content
+moduleAreaEl.innerHTML = '';
+moduleAreaEl.style.opacity = '0';
+moduleAreaEl.style.transition = 'opacity 0.2s ease';
+
+// Force a reflow
+void moduleAreaEl.offsetWidth;
+
+// Fade in
+setTimeout(() => {
+  moduleAreaEl.style.opacity = '1';
+}, 50);
         
         // Load module content
         if (id === 'dashboard') {
@@ -5475,6 +5806,30 @@ const ModuleSystem = (() => {
   };
 })();
 
+// Make openModule globally accessible
+window.openModule = (moduleId) => {
+  console.log('Global openModule called with:', moduleId);
+  if (window.LifeLedger && window.LifeLedger.modules) {
+    window.LifeLedger.modules.openModule(moduleId);
+  } else {
+    console.error('Module system not available yet');
+  }
+};
+
+// Update all onclick handlers in the HTML
+window.addEventListener('DOMContentLoaded', () => {
+  // Fix the welcome view buttons
+  const cards = document.querySelectorAll('#welcome-view .card[onclick*="openModule"]');
+  cards.forEach(card => {
+    const oldOnClick = card.getAttribute('onclick');
+    const match = oldOnClick.match(/openModule\('([^']+)'\)/);
+    if (match) {
+      const moduleId = match[1];
+      card.setAttribute('onclick', `window.LifeLedger.modules.openModule('${moduleId}')`);
+    }
+  });
+});
+
 // ==================== BUILT-IN MODULES ====================
 function registerBuiltinModules() {
   console.log('Registering built-in modules...');
@@ -6347,27 +6702,41 @@ function registerBuiltinModules() {
 }
 
 // ==================== ENHANCED INITIALIZATION ====================
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
   console.log('LifeLedger v' + CONFIG.VERSION + ' initializing...');
   
   try {
+    // Initialize storage system first
+    try {
+      const storageMethod = await Storage.init();
+      console.log(`Storage initialized using: ${storageMethod}`);
+    } catch (storageError) {
+      console.error('Storage initialization failed:', storageError);
+      
+      // Show user-friendly error
+      UIManager.showToast(
+        'Storage initialization failed. The app may not work correctly.',
+        'danger',
+        5000
+      );
+    }
+    
     // Load existing errors
     const savedErrors = localStorage.getItem('lifeledger_errors');
     if (savedErrors) {
       try {
-        ErrorHandler.errors = JSON.parse(savedErrors).slice(-100); // Keep only last 100
+        ErrorHandler.errors = JSON.parse(savedErrors).slice(-100);
       } catch (e) {
         console.warn('Failed to load error log:', e);
       }
     }
     
-    // Set debug mode based on URL or localStorage
+    // Set debug mode
     window.DEBUG_MODE = window.location.hash.includes('debug') || 
                        localStorage.getItem('lifeledger_debug') === 'true';
     
     if (window.DEBUG_MODE) {
       console.log('Debug mode enabled');
-      console.log('Configuration:', CONFIG);
     }
     
     // Register built-in modules
@@ -6382,6 +6751,9 @@ document.addEventListener('DOMContentLoaded', () => {
     // Update dashboard
     ModuleSystem.updateDashboard();
     
+    // Update storage usage immediately
+    await Storage.updateStorageUsage();
+    
     // Check for hash in URL
     const hash = window.location.hash.replace('#', '');
     if (hash.startsWith('module=')) {
@@ -6391,42 +6763,30 @@ document.addEventListener('DOMContentLoaded', () => {
       }, 100);
     }
     
-    // Auto-save interval
-    const autoSaveInterval = setInterval(() => {
-      const state = ModuleSystem.getState();
-      const settings = state.settings || {};
-      if (settings.autoSave !== false) {
-        Storage.saveState(state);
+    // Auto-save interval with storage awareness
+    const autoSaveInterval = setInterval(async () => {
+      try {
+        const state = ModuleSystem.getState();
+        const settings = state.settings || {};
+        if (settings.autoSave !== false) {
+          const success = await Storage.saveState(state);
+          if (!success && window.DEBUG_MODE) {
+            console.warn('Auto-save failed');
+          }
+        }
+      } catch (error) {
+        console.error('Auto-save error:', error);
       }
     }, CONFIG.AUTO_SAVE_DELAY);
     
-    // Auto-backup based on frequency
-    const backupCheckInterval = setInterval(() => {
-      const state = ModuleSystem.getState();
-      const settings = state.settings || {};
-      
-      if (settings.backupFrequency && settings.backupFrequency !== 'never') {
-        const intervals = {
-          daily: 24 * 60 * 60 * 1000,
-          weekly: 7 * 24 * 60 * 60 * 1000,
-          monthly: 30 * 24 * 60 * 60 * 1000
-        };
-        
-        const interval = intervals[settings.backupFrequency];
-        if (interval) {
-          const lastBackup = localStorage.getItem('last_auto_backup');
-          const nextBackupTime = lastBackup ? parseInt(lastBackup) + interval : 0;
-          
-          if (!lastBackup || Date.now() > nextBackupTime) {
-            Storage.createBackup(`${settings.backupFrequency.charAt(0).toUpperCase() + settings.backupFrequency.slice(1)} auto-backup`);
-            localStorage.setItem('last_auto_backup', Date.now().toString());
-            if (window.DEBUG_MODE) {
-              console.log(`${settings.backupFrequency} auto-backup created`);
-            }
-          }
-        }
+    // Storage optimization check (run every 30 minutes)
+    setInterval(async () => {
+      try {
+        await Storage.optimizeStorage();
+      } catch (error) {
+        console.error('Storage optimization check failed:', error);
       }
-    }, 60 * 60 * 1000); // Check every hour
+    }, 30 * 60 * 1000);
     
     // Expose API to global scope
     window.LifeLedger = {
@@ -6440,6 +6800,37 @@ document.addEventListener('DOMContentLoaded', () => {
       performance: PerformanceMonitor,
       cache: CacheManager,
       validator: Validator,
+      
+      // Storage management methods
+      optimizeStorage: () => Storage.optimizeStorage(),
+      clearOldData: async () => {
+        const confirmText = 'Clear data older than 3 months? This cannot be undone.';
+        if (confirm(confirmText)) {
+          const state = await Storage.loadState();
+          const threeMonthsAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
+          let itemsRemoved = 0;
+          
+          Object.keys(state.modules || {}).forEach(moduleId => {
+            const module = state.modules[moduleId];
+            if (!module?.data) return;
+            
+            Object.keys(module.data).forEach(key => {
+              if (Array.isArray(module.data[key])) {
+                const originalLength = module.data[key].length;
+                module.data[key] = module.data[key].filter(item => {
+                  const timestamp = item.updated || item.created || item.date;
+                  return timestamp > threeMonthsAgo;
+                });
+                itemsRemoved += originalLength - module.data[key].length;
+              }
+            });
+          });
+          
+          await Storage.saveState(state);
+          UIManager.showToast(`Cleared ${itemsRemoved} old items`, 'success');
+          ModuleSystem.updateDashboard();
+        }
+      },
       
       // Helper methods
       showShortcuts: () => UIManager.showShortcutsModal(),
@@ -6531,7 +6922,6 @@ document.addEventListener('DOMContentLoaded', () => {
       // Cleanup function for single-page app scenarios
       cleanup: () => {
         clearInterval(autoSaveInterval);
-        clearInterval(backupCheckInterval);
         UIManager.cleanup();
         ModuleSystem.cleanup();
         console.log('LifeLedger cleaned up');
@@ -6548,7 +6938,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const firstLoad = !localStorage.getItem(CONFIG.STORAGE_KEY);
     if (firstLoad) {
       setTimeout(() => {
-        UIManager.showToast('Welcome to LifeLedger! Start by adding some goals or habits.', 'success', 5000);
+        UIManager.showToast('Welcome to LifeLedger! All data is stored locally on your device.', 'success', 5000);
       }, 1000);
     }
     
@@ -6568,7 +6958,7 @@ document.addEventListener('DOMContentLoaded', () => {
     console.error('Failed to initialize LifeLedger:', error);
     ErrorHandler.capture(error, { operation: 'initialization' });
     
-    // Show error to user
+    // Show user-friendly error
     const app = document.getElementById('app');
     const loading = document.getElementById('loading');
     
@@ -6589,17 +6979,20 @@ document.addEventListener('DOMContentLoaded', () => {
           padding: 20px;
           text-align: center;
         ">
-          <div style="font-size: 48px; margin-bottom: 16px;">⚠️</div>
-          <h2 style="margin: 0 0 12px 0;">Initialization Error</h2>
+          <div style="font-size: 48px; margin-bottom: 16px;">💾</div>
+          <h2 style="margin: 0 0 12px 0;">Storage Error</h2>
           <p style="margin: 0 0 20px 0; color: var(--muted); max-width: 400px;">
-            Failed to initialize LifeLedger. The application may be corrupted.
+            Your browser's storage is full. Try:
           </p>
-          <div style="display: flex; gap: 12px;">
-            <button onclick="location.reload()" class="btn-primary" style="padding: 12px 24px;">
-              Reload Application
+          <div style="display: flex; flex-direction: column; gap: 8px; max-width: 300px; margin-bottom: 20px;">
+            <button onclick="LifeLedger.clearOldData()" class="btn-warning" style="width: 100%; padding: 12px;">
+              Clear Old Data
             </button>
-            <button onclick="localStorage.clear(); location.reload()" class="btn-danger" style="padding: 12px 24px;">
-              Reset All Data
+            <button onclick="LifeLedger.ui.showExportModal()" class="btn-primary" style="width: 100%; padding: 12px;">
+              Export & Clear All
+            </button>
+            <button onclick="localStorage.clear(); location.reload()" class="btn-danger" style="width: 100%; padding: 12px;">
+              Reset Everything
             </button>
           </div>
           <p style="margin-top: 20px; font-size: 12px; color: var(--muted); max-width: 400px;">
@@ -6718,6 +7111,39 @@ style.textContent = `
       animation-duration: 0.01ms !important;
       animation-iteration-count: 1 !important;
       transition-duration: 0.01ms !important;
+    }
+  }
+
+  .storage-warning {
+    background: linear-gradient(90deg, var(--warning), #f59e0b) !important;
+    color: white !important;
+    border-left: 4px solid var(--danger) !important;
+  }
+  
+  .storage-critical {
+    background: linear-gradient(90deg, var(--danger), #dc2626) !important;
+    color: white !important;
+    animation: pulse 2s infinite;
+  }
+  
+  @keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.8; }
+    100% { opacity: 1; }
+  }
+  
+  /* Mobile-specific optimizations */
+  @media (max-width: 768px) {
+    .card {
+      padding: 12px !important;
+    }
+    
+    .list-item {
+      padding: 12px !important;
+    }
+    
+    input, textarea, select {
+      font-size: 16px !important; /* Prevents zoom on iOS */
     }
   }
 `;
